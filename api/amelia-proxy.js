@@ -1,9 +1,6 @@
 /**
  * WP Amelia API Proxy
  * Vercel Serverless Function
- * 
- * Handles CORS and proxies requests to user's WP Amelia installation
- * Uses admin-ajax.php endpoint with Amelia header authentication
  */
 export default async function handler(req, res) {
   // CORS headers
@@ -15,73 +12,98 @@ export default async function handler(req, res) {
     'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
   );
 
-  // Handle preflight
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
   }
 
-  // Only allow POST requests
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
-    const { baseUrl, apiKey, endpoint, method = 'GET', body, params } = req.body;
+    const { baseUrl, apiKey, call, method = 'GET', body, queryParams } = req.body;
 
-    // Validation
     if (!baseUrl || !apiKey) {
       return res.status(400).json({ 
         error: 'Missing required fields: baseUrl and apiKey' 
       });
     }
 
-    // Clean and validate base URL
-    const cleanUrl = cleanBaseUrl(baseUrl);
-    if (!cleanUrl) {
-      return res.status(400).json({ 
-        error: 'Invalid base URL format. Should be like: https://yoursite.com' 
+    // Clean base URL
+    let cleanUrl = baseUrl.trim().replace(/\/+$/, '');
+    if (!cleanUrl.match(/^https?:\/\//)) {
+      cleanUrl = 'https://' + cleanUrl;
+    }
+
+    // Build URL exactly like Postman does
+    // Format: {baseUrl}/wp-admin/admin-ajax.php?action=wpamelia_api&call=/api/v1/{endpoint}
+    let apiCall = call || '/api/v1/entities';
+    if (!apiCall.startsWith('/api/v1')) {
+      apiCall = '/api/v1/' + apiCall.replace(/^\//, '');
+    }
+
+    let fullUrl = `${cleanUrl}/wp-admin/admin-ajax.php?action=wpamelia_api&call=${apiCall}`;
+    
+    // Add query params if provided
+    if (queryParams && typeof queryParams === 'object') {
+      Object.entries(queryParams).forEach(([key, value]) => {
+        fullUrl += `&${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
       });
     }
 
-    // Build the full URL using admin-ajax.php
-    const fullUrl = buildAmeliaUrl(cleanUrl, endpoint || '/api/v1/entities', params);
+    console.log('Full URL:', fullUrl);
+    console.log('Method:', method);
+    console.log('API Key (first 10 chars):', apiKey.substring(0, 10) + '...');
 
-    // Make the request to WP Amelia
+    // Make request with Amelia header
     const fetchOptions = {
       method: method,
       headers: {
-        'Content-Type': 'application/json',
-        'Amelia': apiKey  // Amelia uses this header for auth
+        'Amelia': apiKey
       }
     };
 
-    if (body && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+    if (body && ['POST', 'PUT', 'PATCH'].includes(method)) {
+      fetchOptions.headers['Content-Type'] = 'application/json';
       fetchOptions.body = JSON.stringify(body);
     }
 
     const response = await fetch(fullUrl, fetchOptions);
-
-    // Get response text first
     const responseText = await response.text();
 
-    // Try to parse as JSON
+    console.log('Response status:', response.status);
+    console.log('Response (first 200 chars):', responseText.substring(0, 200));
+
+    // Handle empty or "0" response (WordPress returns this for failed ajax)
+    if (!responseText || responseText.trim() === '' || responseText.trim() === '0') {
+      return res.status(200).json({
+        success: false,
+        error: 'Empty response from WordPress',
+        hint: 'This usually means: invalid API key, API not enabled, or wrong endpoint',
+        rawResponse: responseText
+      });
+    }
+
+    // Check for HTML response
+    if (responseText.trim().startsWith('<!') || responseText.trim().toLowerCase().startsWith('<html')) {
+      return res.status(200).json({
+        success: false,
+        error: 'WordPress returned HTML instead of JSON',
+        hint: 'Check that Amelia Pro/Elite is installed with API enabled',
+        rawResponse: responseText.substring(0, 300)
+      });
+    }
+
+    // Try to parse JSON
     let data;
     try {
       data = JSON.parse(responseText);
     } catch (e) {
-      return res.status(500).json({
-        error: 'Invalid JSON response from Amelia',
+      return res.status(200).json({
+        success: false,
+        error: 'Invalid JSON response',
         rawResponse: responseText.substring(0, 500)
-      });
-    }
-
-    // Handle non-OK responses
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: 'WP Amelia API request failed',
-        status: response.status,
-        data: data
       });
     }
 
@@ -92,60 +114,10 @@ export default async function handler(req, res) {
 
   } catch (error) {
     console.error('Proxy error:', error);
-    
-    if (error.message.includes('fetch failed') || error.code === 'ENOTFOUND') {
-      return res.status(500).json({
-        error: 'Cannot reach WordPress site',
-        message: 'The WordPress URL may be incorrect or the site may be down',
-        details: error.message
-      });
-    }
-
     return res.status(500).json({
+      success: false,
       error: 'Proxy request failed',
       message: error.message
     });
   }
-}
-
-/**
- * Clean and standardize the base URL
- */
-function cleanBaseUrl(url) {
-  try {
-    let clean = url.trim().replace(/\/+$/, '');
-    
-    if (!clean.match(/^https?:\/\//)) {
-      clean = 'https://' + clean;
-    }
-
-    new URL(clean);
-    return clean;
-  } catch (e) {
-    return null;
-  }
-}
-
-/**
- * Build the complete Amelia API URL using admin-ajax.php
- */
-function buildAmeliaUrl(baseUrl, endpoint, params = {}) {
-  // Ensure endpoint starts with /api/v1/
-  let cleanEndpoint = endpoint;
-  if (!cleanEndpoint.startsWith('/api/v1/')) {
-    cleanEndpoint = '/api/v1/' + cleanEndpoint.replace(/^\//, '');
-  }
-
-  // Build query string from params
-  const queryParams = new URLSearchParams(params);
-  const queryString = queryParams.toString();
-  
-  // Construct the admin-ajax URL
-  let url = `${baseUrl}/wp-admin/admin-ajax.php?action=wpamelia_api&call=${encodeURIComponent(cleanEndpoint)}`;
-  
-  if (queryString) {
-    url += '&' + queryString;
-  }
-
-  return url;
 }
